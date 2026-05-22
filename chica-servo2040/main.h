@@ -34,7 +34,15 @@
  * Constants
  ******************************************************************************/
 /* Timing */
-constexpr uint GETC_TIMEOUT_US	= 100; // 10bits/115200bps = 86.8us acquire time
+// Per-byte timeout once a command byte has been seen. USB-CDC delivers in
+// ~1 ms bulk frames; 5 ms tolerates one missed/late frame plus host
+// scheduling jitter while still abandoning a dead transfer well inside one
+// 20 ms servo period.
+constexpr uint32_t FRAME_BYTE_TIMEOUT_US	= 5000;
+
+// Non-blocking poll for the first byte of a new frame; matches the
+// tight-loop semantics in main().
+constexpr uint32_t IDLE_POLL_TIMEOUT_US		= 0;
 
 /* LED */
 constexpr float BRIGHTNESS		= 0.3f;		// Normalized

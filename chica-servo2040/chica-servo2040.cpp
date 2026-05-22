@@ -73,148 +73,160 @@ int main()
 /*******************************************************************************
  * Core Functions
  ******************************************************************************/
+enum read_result { READ_OK, READ_TIMEOUT, READ_RESYNC };
+
+// One-byte pushback slot so a stray MSB-set byte mid-frame is preserved as
+// the next frame's command byte rather than dropped on the floor.
+static int pending_byte = -1;
+
+static int next_raw_byte(uint32_t timeout_us)
+{
+	if (pending_byte >= 0)
+	{
+		int b = pending_byte;
+		pending_byte = -1;
+		return b;
+	}
+	return getchar_timeout_us(timeout_us);
+}
+
+// Header (startIdx, count) and SET payload bytes MUST have MSB clear.
+// A MSB-set byte is treated as the start of the next frame.
+static read_result read_inframe_byte(int &out)
+{
+	int c = next_raw_byte(FRAME_BYTE_TIMEOUT_US);
+	if (c == PICO_ERROR_TIMEOUT) return READ_TIMEOUT;
+	if (c & 0x80) { pending_byte = c; return READ_RESYNC; }
+	out = c;
+	return READ_OK;
+}
+
+static bool validate_header(const cmdPkt &p, bool is_set)
+{
+	if (p.count == 0)                       return false;
+	if (p.count > MAX_COUNT_VALUE)          return false;
+	if (p.startIdx >= cmdPin_num)           return false;
+	if (p.startIdx + p.count > cmdPin_num)  return false;
+	if (is_set)
+	{
+		// TS1..VOLT (18..25) are read-only; reject any SET that overlaps.
+		uint end = p.startIdx + p.count; // exclusive
+		bool disjoint = (end <= TS1) || (p.startIdx > VOLT);
+		if (!disjoint) return false;
+	}
+	return true;
+}
+
+static void apply_set(cmdPkt &p)
+{
+	for (uint idx = 0; idx < p.count; idx++, p.startIdx++)
+	{
+		if (p.startIdx <= SERVO18)
+		{
+			servos.pulse(cmdPin_to_hardwarePin((cmdPins)p.startIdx),
+						 p.valueBuff[idx], servoEnabled);
+		}
+		else if (p.startIdx >= RELAY)
+		{
+			bool enableState = p.valueBuff[idx] ? true : false;
+			gpio_put(cmdPin_to_hardwarePin((cmdPins)p.startIdx), enableState);
+			if (p.startIdx == RELAY)
+			{
+				servoEnabled = enableState;
+				if (enableState) servos.enable_all();
+				else             servos.disable_all();
+			}
+		}
+	}
+}
+
+static uint sample_pin(uint startIdx)
+{
+	if (startIdx <= SERVO18)
+	{
+		return servos.pulse(cmdPin_to_hardwarePin((cmdPins)startIdx));
+	}
+	if (startIdx <= TS6)
+	{
+		float v = read_analogPin(cmdPin_to_hardwarePin((cmdPins)startIdx));
+		return (uint)round(v * b1024_3_3V_RATIO);
+	}
+	if (startIdx == CURR)
+	{
+		return (uint)round(read_current() / CURR_LSb) + 512;
+	}
+	if (startIdx == VOLT)
+	{
+		return (uint)round(read_voltage() * b1024_3_3V_RATIO);
+	}
+	return 0; // unreachable post-validation
+}
+
+static void emit_byte(uint8_t b, uint8_t &chk)
+{
+	chk ^= b;
+	putchar_raw(b);
+}
+
+static void emit_get_response(cmdPkt &p)
+{
+	uint8_t chk = 0;
+	emit_byte(GET_CMD, chk);
+	emit_byte((uint8_t)p.startIdx, chk);
+	emit_byte((uint8_t)p.count, chk);
+
+	for (uint i = 0; i < p.count; i++, p.startIdx++)
+	{
+		uint v = sample_pin(p.startIdx);
+		emit_byte(v & 0x7F, chk);
+		emit_byte((v >> 7) & 0x7F, chk);
+	}
+	// Trailing sync/checksum byte: MSB forced set so the host always sees
+	// an unambiguous end-of-response marker.
+	putchar_raw(chk | 0x80);
+}
+
 void parse_and_command_task(void)
 {
-	cmdPkt curr_cmdPkt;
-	uint value = 0;
-	int input;
-
-	input = getchar_timeout_us(GETC_TIMEOUT_US);
-
-	while (input != PICO_ERROR_TIMEOUT)
+	for (;;)
 	{
-		/***************************** START OF PARSING *************************************/
-		// Check if command
-		if (input & 0x80) // Only start parsing if command detected
+		int c = next_raw_byte(IDLE_POLL_TIMEOUT_US);
+		if (c == PICO_ERROR_TIMEOUT) return;
+		if ((c & 0x80) == 0)              continue; // stray non-command byte
+		if (c != SET_CMD && c != GET_CMD) continue; // unknown command
+
+		cmdPkt pkt;
+		pkt.cmd = (c == SET_CMD) ? set : get;
+
+		int b;
+		if (read_inframe_byte(b) != READ_OK) continue;
+		pkt.startIdx = (uint)b;
+		if (read_inframe_byte(b) != READ_OK) continue;
+		pkt.count = (uint)b;
+
+		if (!validate_header(pkt, pkt.cmd == set)) continue;
+
+		if (pkt.cmd == set)
 		{
-			curr_cmdPkt.startIdx = getchar_timeout_us(GETC_TIMEOUT_US);
-			curr_cmdPkt.count = getchar_timeout_us(GETC_TIMEOUT_US);
-
-			if (input == SET_CMD)
+			// Drain the entire payload into valueBuff BEFORE issuing any
+			// side effects, so a mid-frame drop never produces a
+			// half-applied SET.
+			bool ok = true;
+			for (uint idx = 0; idx < pkt.count; idx++)
 			{
-				curr_cmdPkt.cmd = set;
+				int lo, hi;
+				if (read_inframe_byte(lo) != READ_OK) { ok = false; break; }
+				if (read_inframe_byte(hi) != READ_OK) { ok = false; break; }
+				pkt.valueBuff[idx] = (uint)lo | ((uint)hi << 7);
 			}
-			else if (input == GET_CMD)
-			{
-				curr_cmdPkt.cmd = get;
-			}
-			else {
-				break; // xxx: BAD COMMAND, makes compiler happy to avoid uninitalized curr_cmdPkt.cmd>:(
-			}
-
-			if (curr_cmdPkt.cmd == set)
-			{
-				for (uint idx = 0; idx < curr_cmdPkt.count; idx++)
-				{
-					value = 0;
-					value = getchar_timeout_us(GETC_TIMEOUT_US) & 0x7F;
-					value |= (getchar_timeout_us(GETC_TIMEOUT_US) & 0x7F) << 7;
-					curr_cmdPkt.valueBuff[idx] = value;
-				}
-			}
-			/***************************** END OF PARSING *************************************/
-
-			/* NOTE:
-				Servos do not move at all until A0 is SET to to enable by sending a nonzero number
-				to the pin. However, servo values are still saved even before they are enabled.
-				This way the servos will go to PWM values they are set to right after being enabled.
-				If no value was sent to the servo before being enabled, they will move to 1500.
-
-				Servos can be disabled be sending SET ZERO to A0. This will make A0 LOW as well
-				as disable the servoes in software by deasserting the PWM values.
-
-			*/
-			/***************************** RUN COMMAND *************************************/
-			if (curr_cmdPkt.cmd == set)
-			{
-				for (uint idx = 0; idx < curr_cmdPkt.count; idx++, curr_cmdPkt.startIdx++)
-				{
-					// startIdx is servo
-					if (curr_cmdPkt.startIdx <= SERVO18)
-					{
-						servos.pulse(cmdPin_to_hardwarePin((cmdPins)curr_cmdPkt.startIdx),
-									 						curr_cmdPkt.valueBuff[idx], servoEnabled);
-					}
-					// startIdx is A0/A1/A2
-					else if (curr_cmdPkt.startIdx >= RELAY)
-					{
-						bool enableState = curr_cmdPkt.valueBuff[idx] ? true : false;
-
-						// Set physical pins
-						gpio_put(cmdPin_to_hardwarePin((cmdPins)curr_cmdPkt.startIdx), enableState);
-
-						// Enable/disable PWM outputs
-						if (curr_cmdPkt.startIdx == RELAY)
-						{
-							servoEnabled = enableState;
-							if (enableState)
-							{
-								servos.enable_all();
-							}
-							else
-							{
-								servos.disable_all();
-							}
-						}
-					}
-
-				} // for (auto idx = 0; idx < currCmd.count; idx++, currCmd.startIdx++)
-			}	  // if (currCmd.cmd == set)
-			else if (curr_cmdPkt.cmd == get)
-			{
-				uint tx[3] = {GET_CMD, curr_cmdPkt.startIdx, curr_cmdPkt.count};
-				vcp_transmit(tx, 3);
-
-				for (uint idx = 0; idx < curr_cmdPkt.count; idx++, curr_cmdPkt.startIdx++)
-				{
-					// startIdx is servo
-					if (curr_cmdPkt.startIdx <= SERVO18)
-					{
-						uint pwmValue = 0;
-						uint mappedPin = cmdPin_to_hardwarePin((cmdPins)curr_cmdPkt.startIdx);
-						pwmValue = servos.pulse(mappedPin);
-						tx[0] = pwmValue & 0x7F;
-						tx[1] = (pwmValue >> 7) & 0x7F;
-						vcp_transmit(tx, 2);
-					}
-					// startIdx is touch sensor
-					else if (curr_cmdPkt.startIdx <= TS6)
-					{
-						uint mappedPin = cmdPin_to_hardwarePin((cmdPins)curr_cmdPkt.startIdx);
-						float sensor_voltage = read_analogPin(mappedPin);
-						uint voltage_binary = round(sensor_voltage * b1024_3_3V_RATIO);// only send request pin voltage
-						tx[0] = voltage_binary & 0x7F;
-						tx[1] = (voltage_binary >> 7) & 0x7F;
-						vcp_transmit(tx, 2);
-					}
-					else if (curr_cmdPkt.startIdx == CURR)
-					{
-						float current_f = read_current();
-						uint current_binary = round(current_f / CURR_LSb) + 512;
-						tx[0] = current_binary & 0x7F;
-						tx[1] = (current_binary >> 7) & 0x7F;
-						vcp_transmit(tx, 2);
-					}
-					else if (curr_cmdPkt.startIdx == VOLT)
-					{
-						float voltage_f = read_voltage();
-						uint voltage_binary = round(voltage_f * b1024_3_3V_RATIO);
-						tx[0] = voltage_binary & 0x7F;
-						tx[1] = (voltage_binary >> 7) & 0x7F;
-						vcp_transmit(tx, 2);
-					}
-
-				} // for (auto idx = 0; idx < currCmd.count; idx++, currCmd.startIdx++)
-			}	  // else if (currCmd.cmd == get)
-
-			/***************************** COMMAND END *************************************/
-
-		} // if (input & 0x80)
-
-		/***************************** CHECK IF MORE DATA *************************************/
-
-		input = getchar_timeout_us(GETC_TIMEOUT_US);
-	} // while (input != PICO_ERROR_TIMEOUT)
+			if (!ok) continue;
+			apply_set(pkt);
+		}
+		else
+		{
+			emit_get_response(pkt);
+		}
+	}
 }
 /*******************************************************************************
  ******************************************************************************/
