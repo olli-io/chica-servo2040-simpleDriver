@@ -60,7 +60,7 @@ int main()
 	/* Wait for VCP/CDC connection */
 	led_bar.start();
 	while (!stdio_usb_connected()){pendingVCP_ledSequence();}
-	led_bar.clear();
+	connectedVCP_ledSequence();
 
 	/*******************************************************************************
 	 * Application
@@ -280,6 +280,14 @@ void pendingVCP_ledSequence(void)
 	}
 
 	sleep_ms(1000 / updates);
+}
+
+void connectedVCP_ledSequence(void)
+{
+	for (auto i = 0u; i < servo2040::NUM_LEDS; i++)
+	{
+		led_bar.set_hsv(i, 0.333f, 1.0f, BRIGHTNESS);
+	}
 }
 
 /*******************************************************************************

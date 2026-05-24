@@ -141,6 +141,10 @@ void pendingVCP_ledSequence(
 void
 );
 
+void connectedVCP_ledSequence(
+void
+);
+
 /*******************************************************************************
  * Sensing Support Functions
  ******************************************************************************/
