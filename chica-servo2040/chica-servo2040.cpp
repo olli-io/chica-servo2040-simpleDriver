@@ -57,9 +57,13 @@ int main()
 					GPIO_LOW_MASK); // Set LOW
 
 	stdio_init_all();
-	/* Wait for VCP/CDC connection */
 	led_bar.start();
+#ifdef HOST_LINK_USB
+	/* Wait for VCP/CDC connection */
 	while (!stdio_usb_connected()){pendingVCP_ledSequence();}
+#endif
+	/* UART has no connection state to wait on, so drop straight to the
+	 * connected indicator. */
 	connectedVCP_ledSequence();
 
 	/*******************************************************************************

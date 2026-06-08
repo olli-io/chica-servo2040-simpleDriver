@@ -5,7 +5,7 @@ This driver targets the [pimoroni servo 2040 board](https://shop.pimoroni.com/pr
 > This driver was originally made for the [MYP project](https://github.com/makeyourpet/hexapod).
 
 > It diverges from the upstream firmware in three ways:
-> - The host link is **UART on GP20/GP21** instead of USB CDC.
+> - The host link defaults to **USB-CDC** but can be built for **UART on GP20/GP21** (see [Host link options](#host-link-options)).
 > - The **GET reply is terminated with an MSB-set framing byte** so the host can resynchronize unambiguously.
 > - A **firmware-side over-current trip** drops the servo enable when the bus current exceeds a configurable threshold.
 
@@ -23,11 +23,26 @@ To load the firmware onto the Servo 2040 board:
 2) Plug in the USB-C cable to your machine. Hold down the "boot/user" button, press the reset button at the same time, and let go of both buttons. The RP2040 should now appear as a drive to the computer.
 3) Drag and drop the corresponding `.uf2` image file onto the RP2040 drive. The device will automatically reboot and start the loaded program.
 
-## Connecting via UART (GPIO20/GPIO21)
-**UART connection happens through pins labelled BG::SDA (GPIO20) and BG::SCL (GPIO21) 
-The host link is `stdio` routed to **UART1 on GP20 (TX) and GP21 (RX)** at 115200 baud. GP20/GP21 are the only RP2040 UART pin pair that does not collide with the Servo 2040's servo outputs (GP0–GP17), the on-board LED bar (GP18), the ADC mux / user switch (GP22–GP25), or the analog inputs (GP26–GP29). USB CDC stdio is disabled, so the USB-C port is only used for power and for flashing `.uf2` images via BOOTSEL.
+The default firmware build uses USB-CDC for the host link; pass `-DHOST_LINK=UART` to cmake to produce the UART variant. See [Host link options](#host-link-options) below.
 
-Upon startup, the LEDs perform a cyclic rainbow pattern until a host connection is established.
+## Host link options
+The firmware can be built for either USB-CDC (default) or UART. The wire protocol is identical in both modes; only the transport changes.
+
+### USB-CDC (default)
+`stdio` is routed to the USB-C port as a virtual COM port at the host's chosen baud. On startup, the LEDs perform a cyclic rainbow pattern until the host opens the CDC connection, after which the bar turns solid green.
+
+To build the USB variant explicitly:
+```
+cmake -DHOST_LINK=USB ..
+```
+
+### UART on GP20/GP21
+`stdio` is routed to **UART1 on GP20 (TX) and GP21 (RX)** at 115200 baud through the pins labelled BG::SDA (GPIO20) and BG::SCL (GPIO21). GP20/GP21 are the only RP2040 UART pin pair that does not collide with the Servo 2040's servo outputs (GP0–GP17), the on-board LED bar (GP18), the ADC mux / user switch (GP22–GP25), or the analog inputs (GP26–GP29). In this mode USB-CDC stdio is disabled, so the USB-C port is only used for power and for flashing `.uf2` images via BOOTSEL. Because UART has no host-side connection event, the LED bar goes straight to the solid-green "connected" state at boot.
+
+To build the UART variant:
+```
+cmake -DHOST_LINK=UART ..
+```
 
 ## Powering the board
 The board can be powered via the pins labelled 5v and (-), or the usb connections. See 'Battery Power Warning' above for considerations.
